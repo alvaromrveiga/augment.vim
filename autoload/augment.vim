@@ -109,6 +109,84 @@ function! s:RequestCompletion() abort
                 \ })
 endfunction
 
+
+" Check if the current suggestion state matches the current buffer state
+" (same line, column, and changedtick). Returns true if the suggestion is
+" up to date and no action is needed.
+function! s:IsSuggestionCurrent() abort
+    if !exists('b:_augment_suggestion') || empty(b:_augment_suggestion)
+        return v:false
+    endif
+    let info = b:_augment_suggestion
+    return info.req_line == line('.') && info.req_col == col('.') && info.req_changedtick == b:changedtick
+endfunction
+
+" Check if the user typed text that matches the current suggestion, and if so
+" advance the suggestion state to consume what was typed. Returns true if the
+" suggestion was advanced (caller should skip requesting a new completion).
+function! s:AdvanceSuggestionIfMatch() abort
+    if !exists('b:_augment_suggestion') || empty(b:_augment_suggestion)
+        return v:false
+    endif
+
+    let suggestion = b:_augment_suggestion
+
+    " Only advance within the first line of the suggestion. When the first
+    " line is fully consumed (empty), we bail out and let the suggestion be
+    " cleared rather than trying to advance across a newline boundary.
+    if empty(suggestion.lines) || empty(suggestion.lines[0])
+        return v:false
+    endif
+
+    let current_line = line('.')
+    let current_col = col('.')
+
+    " The buffer must have changed to distinguish actual typing from
+    " cursor-only movements (arrow keys, mouse, etc.)
+    if b:changedtick == suggestion.req_changedtick
+        return v:false
+    endif
+
+    " Must be on the same line and cursor must have moved forward
+    if current_line != suggestion.req_line || current_col <= suggestion.req_col
+        return v:false
+    endif
+
+    " Get the text typed since the suggestion was shown
+    let line_text = getline(current_line)
+    let typed_text = strpart(line_text, suggestion.req_col - 1, current_col - suggestion.req_col)
+    let suggestion_first_line = suggestion.lines[0]
+
+    " typed_text must be a prefix of the suggestion's first line
+    if len(typed_text) > len(suggestion_first_line)
+        return v:false
+    endif
+    if strpart(suggestion_first_line, 0, len(typed_text)) !=# typed_text
+        return v:false
+    endif
+
+    " Match confirmed: advance the suggestion state.
+    " No resolveCompletion notification is sent here because the suggestion is
+    " still active (partially consumed). Resolution happens when the suggestion
+    " is eventually fully accepted or cleared.
+    let remaining_first_line = strpart(suggestion_first_line, len(typed_text))
+    let remaining_lines = [remaining_first_line] + suggestion.lines[1:]
+
+    call augment#suggestion#ClearGhostText()
+    call augment#suggestion#Render(remaining_lines)
+
+    let b:_augment_suggestion = {
+                \ 'lines': remaining_lines,
+                \ 'request_id': suggestion.request_id,
+                \ 'req_line': current_line,
+                \ 'req_col': current_col,
+                \ 'req_changedtick': b:changedtick,
+                \ }
+
+    return v:true
+endfunction
+
+
 " Show the log
 function! s:CommandLog(...) abort
     call augment#log#Show()
@@ -302,14 +380,35 @@ function! augment#OnTextChangedI() abort
     if get(b:, '_augment_suggestion_skip_clear', v:false)
         return
     endif
+
+    " If the suggestion is current (already advanced by OnCursorMovedI which
+    " fires BEFORE this event), skip requesting a new completion.
+    if s:IsSuggestionCurrent()
+        return
+    endif
+
     call s:RequestCompletion()
 endfunction
 
 function! augment#OnCursorMovedI() abort
-    " If skip_clear flag is set, don't clear the suggestion
+    " During AcceptWord, skip clearing the suggestion
     if get(b:, '_augment_suggestion_skip_clear', v:false)
         return
     endif
+
+    " CursorMovedI fires BEFORE TextChangedI when the user types a character.
+    " At this point, the buffer already contains the new character and the
+    " cursor has moved, but b:_augment_suggestion still has the old state.
+    " Check if the typed text matches the suggestion and advance it instead
+    " of clearing.
+    if s:IsSuggestionCurrent()
+        return
+    endif
+
+    if s:AdvanceSuggestionIfMatch()
+        return
+    endif
+
     call augment#suggestion#Clear()
 endfunction
 
